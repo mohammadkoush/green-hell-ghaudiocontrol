@@ -37,7 +37,8 @@ can edit it by hand too.
 | `Panel.OpenKey` | K by default |
 | `Mute.AmbientClips` | clip names switched off |
 | `Mute.AnimalVoices` | species switched off |
-| `Mute.AllAmbient` / `Mute.AllAnimalVoices` | the master switches |
+| `Mute.Jungle` | jungle layers switched off |
+| `Mute.AllAmbient` / `Mute.AllAnimalVoices` / `Mute.AllJungle` | the master switches |
 | `Panel.ShowNamesOnScreen` / `ShowNamesSeconds` | the name-as-it-plays line |
 
 The ambient clip names are read from the game at load and listed once in `BepInEx/LogOutput.log`.
