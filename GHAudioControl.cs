@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.5.0";
+        public const string Version = "1.6.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -124,7 +124,7 @@ namespace GHAudioControl
                 "A creature whose voice is set up as 2D plays at full volume wherever it is - the " +
                 "centipede that seems to follow you. On: such a voice is made 3D so it fades with " +
                 "distance. The log names each species and its settings the first time it calls.");
-            _voiceRange = Config.Bind("Voices", "VoiceRangeMetres", 40f,
+            _voiceRange = Config.Bind("Voices", "VoiceRangeMetres", 20f,
                 new ConfigDescription("How far a repaired voice carries before it is silent.",
                     new AcceptableValueRange<float>(5f, 200f)));
             _logPlaying = Config.Bind("Diagnostics", "LogEveryPlayingClip", true,
@@ -220,14 +220,24 @@ namespace GHAudioControl
                     if (!a.isPlaying && !_weMuted.Contains(a)) continue;      // a muted one stops "playing"
                     if (a == animalSrc) continue;
                     AIs.AI owner = a.GetComponentInParent<AIs.AI>();
-                    if (owner != null) { CheckCreatureSource(owner, a); continue; }
+                    if (owner != null) { CheckCreatureSource(owner.m_ID.ToString(), a); continue; }
+
+                    // A CREATURE BY NAME. The centipede's crawl loop sits on "Centipede(Clone)" with
+                    // no AI component above it - the game cannot even load that creature's sound
+                    // script - so the component test skipped it twice. An object named for a species
+                    // is a creature whatever it is made of.
+                    string species = SpeciesFromName(a.gameObject.name);
+                    if (species == null && a.transform.parent != null) species = SpeciesFromName(a.transform.parent.name);
+                    if (species != null) { CheckCreatureSource(species, a); continue; }
+
                     if (a.GetComponentInParent<Player>() != null) continue;    // his own footsteps and breath
                     string nm = a.clip.name;
                     Add(nm, a);
                     if (_seenPlaying.Add(nm) && _logPlaying != null && _logPlaying.Value)
                         Logger.LogInfo("playing: '" + nm + "' on " + a.gameObject.name
                             + (a.transform.parent != null ? " under " + a.transform.parent.name : "")
-                            + " vol=" + a.volume.ToString("F2") + " loop=" + a.loop);
+                            + " vol=" + a.volume.ToString("F2") + " loop=" + a.loop
+                            + " blend=" + a.spatialBlend.ToString("F2") + " max=" + a.maxDistance.ToString("F0"));
                 }
 
                 // 1. The rainforest bed: one multi-sample, its layers named by wav.
@@ -449,26 +459,44 @@ namespace GHAudioControl
         /// crawl clip on a source on the Centipede object - which the voice check never saw. So
         /// every source found under a creature by the census is read and, if 2D, made 3D.
         /// </summary>
-        private void CheckCreatureSource(AIs.AI ai, AudioSource src)
+        private static string[] s_SpeciesNames;
+        private static string SpeciesFromName(string objName)
+        {
+            if (string.IsNullOrEmpty(objName)) return null;
+            if (s_SpeciesNames == null) s_SpeciesNames = Enum.GetNames(typeof(AIs.AI.AIID));
+            for (int i = 0; i < s_SpeciesNames.Length; i++)
+            {
+                string n = s_SpeciesNames[i];
+                if (n == "None" || n == "Count" || n.Length < 4) continue;
+                if (objName.StartsWith(n, StringComparison.OrdinalIgnoreCase)) return n;
+            }
+            return null;
+        }
+
+        private void CheckCreatureSource(string species, AudioSource src)
         {
             try
             {
-                if (ai == null || src == null) return;
-                string key = ai.m_ID + ":" + (src.clip != null ? src.clip.name : src.gameObject.name);
+                if (species == null || src == null) return;
+                string key = species + ":" + (src.clip != null ? src.clip.name : src.gameObject.name);
+                // Two ways to be heard from far away: 2D (no distance at all), or 3D with a range
+                // longer than the voices the game itself sets (12 m). Both are corrected; the log
+                // names which it was.
                 bool flat = src.spatialBlend < 0.99f;
+                bool far  = !flat && src.maxDistance > _voiceRange.Value;
                 if (_spatialSeen.Add(key))
                     Logger.LogInfo("creature source: " + key + " spatialBlend=" + src.spatialBlend.ToString("F2")
                         + " min=" + src.minDistance.ToString("F1") + " max=" + src.maxDistance.ToString("F1")
                         + " rolloff=" + src.rolloffMode + " loop=" + src.loop
-                        + (flat ? "  <- 2D, does not fade with distance" : ""));
-                if (flat && _fix2D.Value)
+                        + (flat ? "  <- 2D, does not fade with distance" : far ? "  <- 3D but carries too far" : ""));
+                if ((flat || far) && _fix2D.Value)
                 {
                     src.spatialBlend = 1f;
-                    src.rolloffMode = AudioRolloffMode.Logarithmic;
+                    src.rolloffMode = AudioRolloffMode.Linear;      // reaches true silence at max, unlike Logarithmic
                     src.minDistance = 1f;
                     src.maxDistance = _voiceRange.Value;
                     if (_spatialSeen.Add("fixed:" + key))
-                        Logger.LogInfo("creature source: " + key + " made 3D, range " + _voiceRange.Value + "m");
+                        Logger.LogInfo("creature source: " + key + (flat ? " made 3D" : " range clamped") + ", " + _voiceRange.Value + "m linear");
                 }
             }
             catch (Exception) { }
@@ -550,10 +578,51 @@ namespace GHAudioControl
             catch (Exception) { }
         }
 
+        // -----------------------------------------------------------------------------------------
+        // Not before the game is playable
+        // -----------------------------------------------------------------------------------------
+        //
+        // "The name of the sound starts displaying before the game loads. We dealt with that with
+        // the minimap." The same gate Field Notes settled on after two wrong versions, copied whole:
+        // m_LoadGameState == None is the RESTING state (FullLoadCompleted is a moment that lasts a
+        // few frames during loading and is false for all of play); a level exists and has started;
+        // the loading screen is down; a player exists; then a short settle. No streamer clause - it
+        // never settles. The mute patches stay live regardless: silencing the menu's ambience harms
+        // nothing. Only what is drawn and swept waits.
+        private float _agreedAt = -1f;
+        private bool _playable;
+
+        private bool GameIsPlayable()
+        {
+            try
+            {
+                GreenHellGame game = GreenHellGame.Instance;
+                if (game == null || game.m_LoadGameState != LoadGameState.None) return NotYet();
+                LoadingScreen screen = LoadingScreen.Get();
+                if (screen != null && screen.m_Active) return NotYet();
+                MainLevel level = MainLevel.Instance;
+                if (level == null || !level.m_LevelStarted) return NotYet();
+                if (Player.Get() == null) return NotYet();
+                if (_agreedAt < 0f) _agreedAt = Time.realtimeSinceStartup;
+                if (Time.realtimeSinceStartup - _agreedAt < 1f) return false;
+                if (!_playable) { _playable = true; Logger.LogInfo("game is playable - panel, name line and census are live"); }
+                return true;
+            }
+            catch (Exception) { return true; }     // a fault in the gate must never take the panel away
+        }
+
+        private bool NotYet()
+        {
+            _agreedAt = -1f;
+            if (_playable) { _playable = false; if (_open) SetOpen(false); }
+            return false;
+        }
+
         private void Update()
         {
             try
             {
+                if (!GameIsPlayable()) return;
                 DiscoverAmbient();
                 JungleTick();
                 AnimalSourceTick();
@@ -579,6 +648,7 @@ namespace GHAudioControl
         private static bool  s_BlockMenu;
         private static float s_BlockMenuUntil;
         private bool _pausedByUs;
+        private bool _inputBlocked;
 
         private void SetOpen(bool open)
         {
@@ -591,14 +661,24 @@ namespace GHAudioControl
                 {
                     s_BlockMenu = true;
                     if (lvl != null) { lvl.Pause(true); _pausedByUs = true; }
+                    // "The actual game is frozen. It's the mouse that keeps moving the screen." The
+                    // pause took; the look did not stop. Both calls are reference-counted by the
+                    // game, so they nest with anything else and must be released symmetrically.
+                    Player pl = Player.Get();
+                    if (pl != null && !_inputBlocked) { pl.BlockRotation(); pl.BlockMoves(); _inputBlocked = true; }
                     CursorManager cm = CursorManager.Get();
                     if (cm != null) { cm.SetCursorLockState(CursorLockMode.None); cm.ShowCursor(true, false); }
+                    Logger.LogInfo("panel opened - paused, look and moves blocked, cursor free (timeScale="
+                                   + Time.timeScale.ToString("F2") + ")");
                 }
                 else
                 {
                     s_BlockMenu = false;
                     s_BlockMenuUntil = Time.realtimeSinceStartup + 0.25f;
                     if (_pausedByUs && lvl != null) { lvl.Pause(false); _pausedByUs = false; }
+                    Player pl = Player.Get();
+                    if (pl != null && _inputBlocked) { pl.UnblockRotation(); pl.UnblockMoves(); }
+                    _inputBlocked = false;
                     CursorManager cm = CursorManager.Get();
                     if (cm != null) { cm.ShowCursor(false, false); cm.SetCursorLockState(CursorLockMode.Locked); }
                 }
@@ -624,7 +704,7 @@ namespace GHAudioControl
                 // The name line is its own small window so it can be dragged anywhere - his ask,
                 // "I wish I could move that name freely". It stays where it was put. While the
                 // panel is open it is always shown, so there is something to grab.
-                bool showName = _showNames.Value
+                bool showName = _playable && _showNames.Value
                     && (_open || (Time.realtimeSinceStartup < s_NowPlayingUntil && s_NowPlaying.Length > 0));
                 if (showName)
                 {
@@ -637,7 +717,7 @@ namespace GHAudioControl
                     _nameRect = GUI.Window(0x6A0D11, _nameRect, DrawNameWindow, "", GUIStyle.none);
                 }
 
-                if (!_open) return;
+                if (!_open || !_playable) return;
                 _rect = GUI.Window(0x6A0D10, _rect, DrawWindow, "");
             }
             catch (Exception ex) { Logger.LogWarning("panel: " + ex.Message); }
