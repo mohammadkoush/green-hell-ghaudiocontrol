@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.7.0";
+        public const string Version = "1.8.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -129,6 +129,10 @@ namespace GHAudioControl
                     "mouse, crab - can be heard. His words: \"this is a critter, not a bat.\" A " +
                     "slider in the K panel, True animal voice tab.",
                     new AcceptableValueRange<float>(2f, 60f)));
+            _critterVolume = Config.Bind("Voices", "CritterVolumePercent", 50f,
+                new ConfigDescription("How loud critters are, as a share of the game's own level. " +
+                    "A slider in the K panel, True animal voice tab.",
+                    new AcceptableValueRange<float>(0f, 100f)));
             _critters = Config.Bind("Voices", "CritterSpecies",
                 "Centipede, Scorpion, GoliathBirdEater, BrasilianWanderingSpider, Caterpillar, Beetle, " +
                 "Mouse, PoisonDartFrog, CaneToad, Crab, Prawn",
@@ -297,6 +301,7 @@ namespace GHAudioControl
                 }
 
                 ReapplyRanges();
+                ReapplyVolumes();
 
                 _jungleNames.Clear();
                 _jungleNames.AddRange(_jungle.Keys);
@@ -462,6 +467,36 @@ namespace GHAudioControl
         private ConfigEntry<bool>  _fix2D;
         private ConfigEntry<float> _voiceRange;
         private ConfigEntry<float> _critterRange;
+        private ConfigEntry<float> _critterVolume;
+        // Every creature source seen, with the volume the game gave it - so a slider scales the
+        // game's own level rather than replacing it, and 100% is exactly what shipped.
+        private readonly Dictionary<AudioSource, float> _baseVolume = new Dictionary<AudioSource, float>();
+        private readonly Dictionary<AudioSource, string> _creatureOf = new Dictionary<AudioSource, string>();
+
+        private void NoteCreatureSource(string species, AudioSource src)
+        {
+            if (src == null) return;
+            if (!_baseVolume.ContainsKey(src)) _baseVolume[src] = src.volume;
+            _creatureOf[src] = species;
+        }
+
+        /// <summary>Critter volume, live: every critter source is held at game volume times the slider.</summary>
+        private void ReapplyVolumes()
+        {
+            float pct = _critterVolume.Value / 100f;
+            List<AudioSource> gone = null;
+            foreach (KeyValuePair<AudioSource, string> kv in _creatureOf)
+            {
+                AudioSource a = kv.Key;
+                if (a == null) { if (gone == null) gone = new List<AudioSource>(); gone.Add(a); continue; }
+                if (!IsCritter(kv.Value)) continue;
+                float baseV;
+                if (!_baseVolume.TryGetValue(a, out baseV)) continue;
+                float want = baseV * pct;
+                if (Mathf.Abs(a.volume - want) > 0.005f) a.volume = want;
+            }
+            if (gone != null) foreach (AudioSource a in gone) { _creatureOf.Remove(a); _baseVolume.Remove(a); }
+        }
         private ConfigEntry<string> _critters;
         private readonly Dictionary<AudioSource, string> _repaired = new Dictionary<AudioSource, string>();
 
@@ -517,6 +552,7 @@ namespace GHAudioControl
             try
             {
                 if (species == null || src == null) return;
+                NoteCreatureSource(species, src);
                 string key = species + ":" + (src.clip != null ? src.clip.name : src.gameObject.name);
                 // Two ways to be heard from far away: 2D (no distance at all), or 3D with a range
                 // longer than the voices the game itself sets (12 m). Both are corrected; the log
@@ -554,6 +590,7 @@ namespace GHAudioControl
                 if (src == null) return;
 
                 string id = ai.m_ID.ToString();
+                s_Self.NoteCreatureSource(id, src);
                 bool flat = src.spatialBlend < 0.99f;
                 if (s_Self._spatialSeen.Add(id))
                     s_Self.Logger.LogInfo("voice: " + id + " spatialBlend=" + src.spatialBlend.ToString("F2")
@@ -830,8 +867,9 @@ namespace GHAudioControl
             if (_tab == 1)
             {
                 GUILayout.Space(4f);
-                _critterRange.Value = Slider("Critters and small creatures", _critterRange.Value, 2f, 60f);
-                _voiceRange.Value   = Slider("Other creatures", _voiceRange.Value, 5f, 200f);
+                _critterRange.Value  = Slider("Critters: how far", _critterRange.Value, 2f, 60f, " m");
+                _critterVolume.Value = Slider("Critters: how loud", _critterVolume.Value, 0f, 100f, " %");
+                _voiceRange.Value    = Slider("Other creatures: how far", _voiceRange.Value, 5f, 200f, " m");
             }
             GUILayout.Space(6f);
 
@@ -922,11 +960,11 @@ namespace GHAudioControl
         }
 
         /// <summary>A labelled slider in metres, laid out like a row: name left, value right, bar under.</summary>
-        private float Slider(string label, float value, float lo, float hi)
+        private float Slider(string label, float value, float lo, float hi, string unit)
         {
             GUILayout.BeginHorizontal();
             GUILayout.Label("        " + label, _row, GUILayout.ExpandWidth(true));
-            GUILayout.Label(Mathf.RoundToInt(value) + " m", _row, GUILayout.Width(60f));
+            GUILayout.Label(Mathf.RoundToInt(value) + unit, _row, GUILayout.Width(60f));
             GUILayout.EndHorizontal();
             float v = GUILayout.HorizontalSlider(value, lo, hi);
             GUILayout.Space(4f);
