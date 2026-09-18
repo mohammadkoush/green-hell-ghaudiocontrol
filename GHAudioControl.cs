@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.4.0";
+        public const string Version = "1.5.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -57,9 +57,6 @@ namespace GHAudioControl
         private ConfigEntry<string> _mutedAmbient;
         private ConfigEntry<string> _mutedAnimals;
         private ConfigEntry<string> _mutedJungle;
-        private ConfigEntry<bool>   _muteAllJungle;
-        private ConfigEntry<bool>   _muteAllAmbient;
-        private ConfigEntry<bool>   _muteAllAnimals;
         private ConfigEntry<bool>   _showNames;
         private ConfigEntry<float>  _nameSeconds;
         private ConfigEntry<string> _windowPos;
@@ -89,11 +86,11 @@ namespace GHAudioControl
         // ---- window ------------------------------------------------------------------------------
         private bool _open;
         private int  _tab;                       // 0 Ambient, 1 True animal voice
-        private Rect _rect = new Rect(200f, 120f, 420f, 560f);
+        private Rect _rect = new Rect(200f, 120f, 560f, 620f);
         private Vector2 _scroll;
         private GUIStyle _title, _row, _tabOn, _tabOff, _dim, _rowBtn, _rowBtnDim, _nameStyle;
         private bool _styled;
-        private Texture2D _radioOn, _radioOff, _pixel;
+        private Texture2D _radioOn, _radioOff, _pixel, _cross;
         private readonly Dictionary<string, Texture2D> _icons = new Dictionary<string, Texture2D>();
         private string _iconDir;
 
@@ -111,16 +108,10 @@ namespace GHAudioControl
             _mutedAnimals = Config.Bind("Mute", "AnimalVoices", "",
                 "Species whose idle calls are switched OFF, by AI name (Tapir, Capybara, " +
                 "GoldenLionTamarin...), comma separated. Attack, panic and death sounds always play.");
-            _muteAllAmbient = Config.Bind("Mute", "AllAmbient", false,
-                "Master switch for the whole ambient animal layer.");
-            _muteAllAnimals = Config.Bind("Mute", "AllAnimalVoices", false,
-                "Master switch for every creature's idle calls.");
             _mutedJungle = Config.Bind("Mute", "Jungle", "",
                 "Jungle layers switched OFF, by name, comma separated: the rainforest bed's layers " +
                 "(rain, wind, water, day, night...), 'Rain and thunder', and world emitters by clip " +
                 "name (rivers, waterfalls). Written by the panel.");
-            _muteAllJungle = Config.Bind("Mute", "AllJungle", false,
-                "Master switch for every jungle layer - the game's Environment slider, split.");
             _showNames = Config.Bind("Panel", "ShowNamesOnScreen", true,
                 "Name each sound on screen as it plays, so you can decide what to switch off. " +
                 "Turn it off once you are done choosing.");
@@ -228,7 +219,8 @@ namespace GHAudioControl
                     if (a == null || a.clip == null) continue;
                     if (!a.isPlaying && !_weMuted.Contains(a)) continue;      // a muted one stops "playing"
                     if (a == animalSrc) continue;
-                    if (a.GetComponentInParent<AIs.AI>() != null) continue;
+                    AIs.AI owner = a.GetComponentInParent<AIs.AI>();
+                    if (owner != null) { CheckCreatureSource(owner, a); continue; }
                     if (a.GetComponentInParent<Player>() != null) continue;    // his own footsteps and breath
                     string nm = a.clip.name;
                     Add(nm, a);
@@ -293,12 +285,23 @@ namespace GHAudioControl
                 // keeps silent stays the game's business.
                 foreach (KeyValuePair<string, List<AudioSource>> kv in _jungle)
                 {
-                    bool mute = _muteAllJungle.Value || _mutedJungleSet.Contains(kv.Key);
+                    bool mute = _mutedJungleSet.Contains(kv.Key);
                     for (int i = 0; i < kv.Value.Count; i++)
                     {
                         AudioSource src = kv.Value[i];
                         if (src == null) continue;
-                        if (mute) { if (!src.mute) { src.mute = true; _weMuted.Add(src); Logger.LogInfo("jungle: muted '" + kv.Key + "' (" + src.gameObject.name + ")"); } }
+                        if (mute)
+                        {
+                            if (!src.mute)
+                            {
+                                src.mute = true;
+                                if (!src.loop && src.isPlaying) src.Stop();   // a one-shot ends now, not at its tail
+                                _weMuted.Add(src);
+                                float took = (_clickAt > 0f) ? (Time.realtimeSinceStartup - _clickAt) : -1f;
+                                Logger.LogInfo("jungle: muted '" + kv.Key + "' (" + src.gameObject.name + ")"
+                                    + (took >= 0f ? "  " + took.ToString("F2") + "s after the click" : ""));
+                            }
+                        }
                         else if (_weMuted.Contains(src)) { src.mute = false; _weMuted.Remove(src); Logger.LogInfo("jungle: un-muted '" + kv.Key + "'"); }
                     }
                 }
@@ -386,14 +389,12 @@ namespace GHAudioControl
         private static bool AmbientMuted(string clipName)
         {
             if (s_Self == null || clipName == null) return false;
-            if (s_Self._muteAllAmbient.Value) return true;
             return s_Self._mutedAmbientSet.Contains(clipName);
         }
 
         private static bool AnimalMuted(AIs.AI.AIID id)
         {
             if (s_Self == null) return false;
-            if (s_Self._muteAllAnimals.Value) return true;
             return s_Self._mutedAnimalSet.Contains(id.ToString());
         }
 
@@ -441,6 +442,37 @@ namespace GHAudioControl
         private ConfigEntry<float> _voiceRange;
         private static FieldInfo s_ModuleSource;
         private readonly HashSet<string> _spatialSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Any sound source on a creature, not only its voice. His log: the centipede has no voice
+        /// module at all (the game cannot load its sound script) and what he hears is a looping
+        /// crawl clip on a source on the Centipede object - which the voice check never saw. So
+        /// every source found under a creature by the census is read and, if 2D, made 3D.
+        /// </summary>
+        private void CheckCreatureSource(AIs.AI ai, AudioSource src)
+        {
+            try
+            {
+                if (ai == null || src == null) return;
+                string key = ai.m_ID + ":" + (src.clip != null ? src.clip.name : src.gameObject.name);
+                bool flat = src.spatialBlend < 0.99f;
+                if (_spatialSeen.Add(key))
+                    Logger.LogInfo("creature source: " + key + " spatialBlend=" + src.spatialBlend.ToString("F2")
+                        + " min=" + src.minDistance.ToString("F1") + " max=" + src.maxDistance.ToString("F1")
+                        + " rolloff=" + src.rolloffMode + " loop=" + src.loop
+                        + (flat ? "  <- 2D, does not fade with distance" : ""));
+                if (flat && _fix2D.Value)
+                {
+                    src.spatialBlend = 1f;
+                    src.rolloffMode = AudioRolloffMode.Logarithmic;
+                    src.minDistance = 1f;
+                    src.maxDistance = _voiceRange.Value;
+                    if (_spatialSeen.Add("fixed:" + key))
+                        Logger.LogInfo("creature source: " + key + " made 3D, range " + _voiceRange.Value + "m");
+                }
+            }
+            catch (Exception) { }
+        }
 
         private static void CheckSpatial(AIs.AISoundModule module, AIs.AI ai)
         {
@@ -525,10 +557,62 @@ namespace GHAudioControl
                 DiscoverAmbient();
                 JungleTick();
                 AnimalSourceTick();
-                if (_key.Value.IsDown()) _open = !_open;
-                if (_open && Input.GetKeyDown(KeyCode.Escape)) _open = false;
+                if (_key.Value.IsDown()) SetOpen(!_open);
+                if (_open && Input.GetKeyDown(KeyCode.Escape)) SetOpen(false);
             }
             catch (Exception) { }
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // Open / close - the Pickup Doctor recipe, copied because it is the one that works
+        // -----------------------------------------------------------------------------------------
+        //
+        // Escape is read by the game through legacy Input polling in its own Update; Event.Use() in
+        // OnGUI only consumes it for IMGUI. So "Escape closes the panel" was also "Escape opens the
+        // pause menu". The fix is to refuse the menu itself while the panel is open, plus a short
+        // grace after closing because the game may poll the same press later in the same frame.
+        // Time-boxed, so a fault can never leave the pause menu permanently unopenable.
+        //
+        // And while open: the level's own reference-counted pause, and the cursor freed through the
+        // game's CursorManager - without that the mouse stays locked under the panel, which is a
+        // large part of why clicking rows felt unreliable at first.
+        private static bool  s_BlockMenu;
+        private static float s_BlockMenuUntil;
+        private bool _pausedByUs;
+
+        private void SetOpen(bool open)
+        {
+            if (open == _open) return;
+            _open = open;
+            try
+            {
+                MainLevel lvl = MainLevel.Instance;
+                if (open)
+                {
+                    s_BlockMenu = true;
+                    if (lvl != null) { lvl.Pause(true); _pausedByUs = true; }
+                    CursorManager cm = CursorManager.Get();
+                    if (cm != null) { cm.SetCursorLockState(CursorLockMode.None); cm.ShowCursor(true, false); }
+                }
+                else
+                {
+                    s_BlockMenu = false;
+                    s_BlockMenuUntil = Time.realtimeSinceStartup + 0.25f;
+                    if (_pausedByUs && lvl != null) { lvl.Pause(false); _pausedByUs = false; }
+                    CursorManager cm = CursorManager.Get();
+                    if (cm != null) { cm.ShowCursor(false, false); cm.SetCursorLockState(CursorLockMode.Locked); }
+                }
+            }
+            catch (Exception ex) { Logger.LogWarning("open/close: " + ex.Message); }
+        }
+
+        [HarmonyPatch(typeof(MenuInGameManager), "ShowScreen")]
+        private static class Patch_BlockGameMenu
+        {
+            private static bool Prefix()
+            {
+                return !(s_BlockMenu || Time.realtimeSinceStartup < s_BlockMenuUntil);
+            }
         }
 
         private void OnGUI()
@@ -598,37 +682,26 @@ namespace GHAudioControl
             if (GUILayout.Toggle(_tab == 2, "Jungle (everything playing)", _tab == 2 ? _tabOn : _tabOff)) _tab = 2;
             GUILayout.EndHorizontal();
 
-            // RESET, one per tab, his ask: "a reset button that turns on all options". Clears the
-            // tab's list and its master switch; the others are not touched.
+            // ONE STYLE. His rule, with a screenshot: the reset button and the master checkbox did the
+            // same job in opposite directions in two different clothes. Every line on this panel is
+            // now the same row - circle on the left, icon, name - and the master line is the rows'
+            // own state: filled when nothing on the tab is muted, empty when everything is, and
+            // clicking it sets every row. The rows are the only state, so the two can never disagree.
             GUILayout.Space(4f);
-            if (GUILayout.Button("Turn everything on this tab back ON", GUILayout.Height(26f)))
+            int mutedHere = (_tab == 0) ? _mutedAmbientSet.Count : (_tab == 1) ? _mutedAnimalSet.Count : _mutedJungleSet.Count;
+            string masterLabel = (_tab == 0) ? "Whole ambient layer" : (_tab == 1) ? "Every creature's idle calls" : "Every jungle layer";
+            bool masterOn = (mutedHere == 0);
+            if (Row(null, masterLabel, masterOn) != masterOn)
             {
-                if (_tab == 0)      { _mutedAmbientSet.Clear(); _muteAllAmbient.Value = false; }
-                else if (_tab == 1) { _mutedAnimalSet.Clear();  _muteAllAnimals.Value = false; }
-                else                { _mutedJungleSet.Clear();  _muteAllJungle.Value  = false; _jungleAt = 0f; }
+                if (masterOn) MuteAllOnTab(_tab); else UnmuteAllOnTab(_tab);
                 SaveLists();
-                Logger.LogInfo("panel: reset tab " + _tab + " - everything on");
+                ApplyNow();
             }
-            if (_tab == 0)
-            {
-                bool all = GUILayout.Toggle(!_muteAllAmbient.Value, "  whole ambient layer");
-                if (all == _muteAllAmbient.Value) _muteAllAmbient.Value = !all;
-            }
-            else if (_tab == 1)
-            {
-                bool all = GUILayout.Toggle(!_muteAllAnimals.Value, "  every creature's idle calls");
-                if (all == _muteAllAnimals.Value) _muteAllAnimals.Value = !all;
-            }
-            else
-            {
-                bool all = GUILayout.Toggle(!_muteAllJungle.Value, "  every jungle layer");
-                if (all == _muteAllJungle.Value) _muteAllJungle.Value = !all;
-            }
-            bool names = GUILayout.Toggle(_showNames.Value, "  name each sound on screen as it plays");
-            if (names != _showNames.Value) _showNames.Value = names;
+            bool names = _showNames.Value;
+            if (Row(null, "Name each sound on screen as it plays", names) != names) _showNames.Value = !names;
             GUILayout.Space(6f);
 
-            _scroll = GUILayout.BeginScrollView(_scroll);
+            _scroll = GUILayout.BeginScrollView(_scroll, false, true);
             if (_tab == 0)
             {
                 if (_ambientNames.Count == 0)
@@ -641,6 +714,7 @@ namespace GHAudioControl
                     {
                         if (on) _mutedAmbientSet.Add(n); else _mutedAmbientSet.Remove(n);
                         SaveLists();
+                        ApplyNow();
                     }
                 }
             }
@@ -656,7 +730,7 @@ namespace GHAudioControl
                     {
                         if (on) _mutedJungleSet.Add(n); else _mutedJungleSet.Remove(n);
                         SaveLists();
-                        _jungleAt = 0f;                       // apply now, not in two seconds
+                        ApplyNow();
                     }
                 }
             }
@@ -670,16 +744,61 @@ namespace GHAudioControl
                     {
                         if (on) _mutedAnimalSet.Add(n); else _mutedAnimalSet.Remove(n);
                         SaveLists();
+                        ApplyNow();
                     }
                 }
             }
             GUILayout.EndScrollView();
 
-            GUILayout.Label(_key.Value.MainKey + " or Esc closes.  Drag the top edge to move.", _dim);
+            // Close is a row too - the same shape as everything else, an x where the circle goes.
+            GUILayout.Space(4f);
+            if (ActionRow("Close   (" + _key.Value.MainKey + " or Esc)")) SetOpen(false);
             GUILayout.EndVertical();
 
             GUI.DragWindow(new Rect(0f, 0f, _rect.width, 28f));
             SaveWindowPos();
+        }
+
+        private void MuteAllOnTab(int tab)
+        {
+            if (tab == 0)      { _mutedAmbientSet.Clear(); foreach (string n in _ambientNames) _mutedAmbientSet.Add(n); }
+            else if (tab == 1) { _mutedAnimalSet.Clear();  foreach (string n in _animalNames)  _mutedAnimalSet.Add(n); }
+            else               { _mutedJungleSet.Clear();  foreach (string n in _jungleNames)  _mutedJungleSet.Add(n); }
+            Logger.LogInfo("panel: tab " + tab + " - everything OFF");
+        }
+
+        private void UnmuteAllOnTab(int tab)
+        {
+            if (tab == 0) _mutedAmbientSet.Clear(); else if (tab == 1) _mutedAnimalSet.Clear(); else _mutedJungleSet.Clear();
+            Logger.LogInfo("panel: tab " + tab + " - everything ON");
+        }
+
+        /// <summary>
+        /// The mute lands in the same frame as the click - no waiting for the two-second sweep.
+        /// His report: "it takes between 3 to 5 seconds for it to take effect". The sweep timer is
+        /// reset so the next Update rebuilds and applies; the click's time is kept so the log can
+        /// say how long the silence actually took, measured, next time it is asked.
+        /// </summary>
+        private float _clickAt;
+        private void ApplyNow()
+        {
+            _jungleAt = 0f;
+            _animalStopAt = 0f;
+            _clickAt = Time.realtimeSinceStartup;
+        }
+
+        /// <summary>A row that does something rather than holding a state: an x in the circle's slot.</summary>
+        private bool ActionRow(string label)
+        {
+            GUIContent c = new GUIContent("    " + label);
+            bool clicked = GUILayout.Button(c, _rowBtn, GUILayout.Height(32f));
+            if (Event.current.type == EventType.Repaint)
+            {
+                Rect r = GUILayoutUtility.GetLastRect();
+                Rect rr = new Rect(r.x + 8f, r.y + (r.height - 22f) * 0.5f, 22f, 22f);
+                GUI.DrawTexture(rr, _cross, ScaleMode.ScaleToFit, true);
+            }
+            return clicked;
         }
 
         /// <summary>
@@ -693,12 +812,15 @@ namespace GHAudioControl
         /// </summary>
         private bool Row(Texture2D icon, string label, bool on)
         {
+            // Circle first, his ask: "place all of the clickable radial circles to the left of the
+            // options" - on the right they sat half under the scrollbar. The button's own padding
+            // leaves the slot; the circle is drawn into it on Repaint.
             GUIContent c = new GUIContent("    " + label, icon);
             bool clicked = GUILayout.Button(c, on ? _rowBtn : _rowBtnDim, GUILayout.Height(32f));
             if (Event.current.type == EventType.Repaint)
             {
                 Rect r = GUILayoutUtility.GetLastRect();
-                Rect rr = new Rect(r.xMax - 30f, r.y + (r.height - 22f) * 0.5f, 22f, 22f);
+                Rect rr = new Rect(r.x + 8f, r.y + (r.height - 22f) * 0.5f, 22f, 22f);
                 GUI.DrawTexture(rr, on ? _radioOn : _radioOff, ScaleMode.ScaleToFit, true);
             }
             if (clicked)
@@ -821,6 +943,7 @@ namespace GHAudioControl
 
             _radioOn  = Radio(true);
             _radioOff = Radio(false);
+            _cross    = Cross();
 
             _title = new GUIStyle(GUI.skin.label);
             _title.fontSize = 18; _title.fontStyle = FontStyle.Bold;
@@ -842,7 +965,7 @@ namespace GHAudioControl
             _rowBtn.hover.background = HoverTex();
             _rowBtn.normal.textColor = _row.normal.textColor;
             _rowBtn.hover.textColor = Color.white; _rowBtn.active.textColor = Color.white;
-            _rowBtn.padding = new RectOffset(6, 34, 3, 3);
+            _rowBtn.padding = new RectOffset(38, 6, 3, 3);       // room for the circle on the left
             _rowBtnDim = new GUIStyle(_rowBtn);
             _rowBtnDim.normal.textColor = _dim.normal.textColor;
 
@@ -862,6 +985,23 @@ namespace GHAudioControl
         {
             Texture2D t = new Texture2D(1, 1, TextureFormat.ARGB32, false);
             t.SetPixel(0, 0, new Color(1f, 1f, 1f, 0.08f));
+            t.Apply();
+            return t;
+        }
+
+        /// <summary>An x, for the one row that acts instead of holding a state.</summary>
+        private static Texture2D Cross()
+        {
+            const int S = 32;
+            Texture2D t = new Texture2D(S, S, TextureFormat.ARGB32, false);
+            Color ink = new Color(0.85f, 0.87f, 0.92f, 1f);
+            for (int y = 0; y < S; y++)
+                for (int x = 0; x < S; x++)
+                {
+                    bool d1 = Mathf.Abs(x - y) <= 2 && x >= 8 && x <= 23;
+                    bool d2 = Mathf.Abs(x - (S - 1 - y)) <= 2 && x >= 8 && x <= 23;
+                    t.SetPixel(x, y, (d1 || d2) ? ink : new Color(0f, 0f, 0f, 0f));
+                }
             t.Apply();
             return t;
         }
