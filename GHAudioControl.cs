@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.8.0";
+        public const string Version = "1.8.1";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -133,6 +133,12 @@ namespace GHAudioControl
                 new ConfigDescription("How loud critters are, as a share of the game's own level. " +
                     "A slider in the K panel, True animal voice tab.",
                     new AcceptableValueRange<float>(0f, 100f)));
+            _warningClips = Config.Bind("Voices", "WarningClipsKeepFullVolume", "Scolopendra_crawl",
+                "Clips the critter volume slider must NOT touch, because they are warnings. His " +
+                "words on the centipede: the crawl over the item in your hand is the warning and " +
+                "stays as it is; the squeal while it burrows after you drop the item is the part to " +
+                "quieten. Clip names, comma separated, substring match. Every critter clip is named " +
+                "in the log the first time it plays, so the list can be extended by reading it.");
             _critters = Config.Bind("Voices", "CritterSpecies",
                 "Centipede, Scorpion, GoliathBirdEater, BrasilianWanderingSpider, Caterpillar, Beetle, " +
                 "Mouse, PoisonDartFrog, CaneToad, Crab, Prawn",
@@ -468,10 +474,23 @@ namespace GHAudioControl
         private ConfigEntry<float> _voiceRange;
         private ConfigEntry<float> _critterRange;
         private ConfigEntry<float> _critterVolume;
+        private ConfigEntry<string> _warningClips;
+
+        private bool IsWarningClip(AudioSource a)
+        {
+            if (a == null || a.clip == null) return false;
+            foreach (string w in (_warningClips.Value ?? "").Split(','))
+            {
+                string k = w.Trim();
+                if (k.Length > 0 && a.clip.name.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return false;
+        }
         // Every creature source seen, with the volume the game gave it - so a slider scales the
         // game's own level rather than replacing it, and 100% is exactly what shipped.
         private readonly Dictionary<AudioSource, float> _baseVolume = new Dictionary<AudioSource, float>();
         private readonly Dictionary<AudioSource, string> _creatureOf = new Dictionary<AudioSource, string>();
+        private readonly HashSet<AudioSource> _volumeSet = new HashSet<AudioSource>();
 
         private void NoteCreatureSource(string species, AudioSource src)
         {
@@ -480,22 +499,31 @@ namespace GHAudioControl
             _creatureOf[src] = species;
         }
 
-        /// <summary>Critter volume, live: every critter source is held at game volume times the slider.</summary>
+        /// <summary>
+        /// Critter volume. SET, not chased: his point - "why not set the value instead of changing
+        /// it per frame? That would lag the game on slow PCs." The value is written when a source
+        /// is first seen and again only when the slider has moved; between those nothing is
+        /// touched. Warning clips are exempt.
+        /// </summary>
+        private float _appliedPct = -1f;
         private void ReapplyVolumes()
         {
             float pct = _critterVolume.Value / 100f;
+            bool sliderMoved = Mathf.Abs(pct - _appliedPct) > 0.001f;
+            _appliedPct = pct;
             List<AudioSource> gone = null;
             foreach (KeyValuePair<AudioSource, string> kv in _creatureOf)
             {
                 AudioSource a = kv.Key;
                 if (a == null) { if (gone == null) gone = new List<AudioSource>(); gone.Add(a); continue; }
-                if (!IsCritter(kv.Value)) continue;
+                if (!IsCritter(kv.Value) || IsWarningClip(a)) continue;
                 float baseV;
                 if (!_baseVolume.TryGetValue(a, out baseV)) continue;
-                float want = baseV * pct;
-                if (Mathf.Abs(a.volume - want) > 0.005f) a.volume = want;
+                bool fresh = _volumeSet.Add(a);
+                if (!fresh && !sliderMoved) continue;
+                a.volume = baseV * pct;
             }
-            if (gone != null) foreach (AudioSource a in gone) { _creatureOf.Remove(a); _baseVolume.Remove(a); }
+            if (gone != null) foreach (AudioSource a in gone) { _creatureOf.Remove(a); _baseVolume.Remove(a); _volumeSet.Remove(a); }
         }
         private ConfigEntry<string> _critters;
         private readonly Dictionary<AudioSource, string> _repaired = new Dictionary<AudioSource, string>();
@@ -512,9 +540,14 @@ namespace GHAudioControl
             return IsCritter(species) ? _critterRange.Value : _voiceRange.Value;
         }
 
-        /// <summary>Sliders move live: every source this mod has repaired is re-ranged each sweep.</summary>
+        /// <summary>Ranges are re-written only when a slider has moved; otherwise nothing is touched.</summary>
+        private float _appliedCritterRange = -1f, _appliedVoiceRange = -1f;
         private void ReapplyRanges()
         {
+            bool moved = Mathf.Abs(_critterRange.Value - _appliedCritterRange) > 0.01f
+                      || Mathf.Abs(_voiceRange.Value - _appliedVoiceRange) > 0.01f;
+            _appliedCritterRange = _critterRange.Value; _appliedVoiceRange = _voiceRange.Value;
+            if (!moved) return;
             List<AudioSource> gone = null;
             foreach (KeyValuePair<AudioSource, string> kv in _repaired)
             {
