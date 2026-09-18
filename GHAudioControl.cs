@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.3.0";
+        public const string Version = "1.4.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -129,6 +129,13 @@ namespace GHAudioControl
                     new AcceptableValueRange<float>(1f, 15f)));
             _windowPos = Config.Bind("Panel", "WindowPosition", "",
                 "Where the panel was last dragged. Written automatically.");
+            _fix2D = Config.Bind("Voices", "Make2DVoices3D", true,
+                "A creature whose voice is set up as 2D plays at full volume wherever it is - the " +
+                "centipede that seems to follow you. On: such a voice is made 3D so it fades with " +
+                "distance. The log names each species and its settings the first time it calls.");
+            _voiceRange = Config.Bind("Voices", "VoiceRangeMetres", 40f,
+                new ConfigDescription("How far a repaired voice carries before it is silent.",
+                    new AcceptableValueRange<float>(5f, 200f)));
             _logPlaying = Config.Bind("Diagnostics", "LogEveryPlayingClip", true,
                 "Write one log line the first time each clip is heard playing - the object it is " +
                 "on, its parent, its volume. This is how a sound that will not mute names itself.");
@@ -415,6 +422,55 @@ namespace GHAudioControl
             }
         }
 
+        // -----------------------------------------------------------------------------------------
+        // Voices that do not fade with distance
+        // -----------------------------------------------------------------------------------------
+        //
+        // HIS REPORT: "The centipede sound does not fade away when we move away from that creature.
+        // The audio stays at 100%, like the centipede moving with you. But I can see it far away.
+        // So the audio is not calculating the distance."
+        //
+        // A Unity AudioSource only attenuates when its spatialBlend is 1 (3D). A source left at 0
+        // plays in both ears at full volume wherever it is - which is exactly a centipede that
+        // follows you. Whether that is the fault is READ, not assumed: the first time each species
+        // plays, its source's spatialBlend, min and max distance and rolloff are written to the
+        // log. Then, if the setting is on, any voice with spatialBlend below 1 is made 3D with a
+        // sane range, and the log says so. The species stays in the log either way, so the report
+        // that comes back names the numbers.
+        private ConfigEntry<bool>  _fix2D;
+        private ConfigEntry<float> _voiceRange;
+        private static FieldInfo s_ModuleSource;
+        private readonly HashSet<string> _spatialSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static void CheckSpatial(AIs.AISoundModule module, AIs.AI ai)
+        {
+            try
+            {
+                if (s_Self == null || ai == null) return;
+                if (s_ModuleSource == null) s_ModuleSource = AccessTools.Field(typeof(AIs.AISoundModule), "m_AudioSource");
+                AudioSource src = (s_ModuleSource != null) ? s_ModuleSource.GetValue(module) as AudioSource : null;
+                if (src == null) return;
+
+                string id = ai.m_ID.ToString();
+                bool flat = src.spatialBlend < 0.99f;
+                if (s_Self._spatialSeen.Add(id))
+                    s_Self.Logger.LogInfo("voice: " + id + " spatialBlend=" + src.spatialBlend.ToString("F2")
+                        + " min=" + src.minDistance.ToString("F1") + " max=" + src.maxDistance.ToString("F1")
+                        + " rolloff=" + src.rolloffMode + (flat ? "  <- 2D, does not fade with distance" : ""));
+
+                if (flat && s_Self._fix2D.Value)
+                {
+                    src.spatialBlend = 1f;
+                    src.rolloffMode = AudioRolloffMode.Logarithmic;
+                    src.minDistance = 1f;
+                    src.maxDistance = s_Self._voiceRange.Value;
+                    if (s_Self._spatialSeen.Add("fixed:" + id))
+                        s_Self.Logger.LogInfo("voice: " + id + " made 3D, range " + s_Self._voiceRange.Value + "m");
+                }
+            }
+            catch (Exception) { }
+        }
+
         // A real creature's idle call. Returning false skips the whole method - the Stop(), the
         // PlayOneShot and the multiplayer echo - which is exactly "this animal says nothing now".
         private static FieldInfo s_ModuleAI;
@@ -429,6 +485,7 @@ namespace GHAudioControl
                     if (s_ModuleAI == null) s_ModuleAI = AccessTools.Field(typeof(AIs.AIModule), "m_AI");
                     AIs.AI ai = (s_ModuleAI != null) ? s_ModuleAI.GetValue(__instance) as AIs.AI : null;
                     if (ai == null) return true;
+                    CheckSpatial(__instance, ai);
                     if (AnimalMuted(ai.m_ID)) return false;
                     NowPlaying(Pretty(ai.m_ID.ToString()) + ": idle call");
                 }
@@ -541,8 +598,17 @@ namespace GHAudioControl
             if (GUILayout.Toggle(_tab == 2, "Jungle (everything playing)", _tab == 2 ? _tabOn : _tabOff)) _tab = 2;
             GUILayout.EndHorizontal();
 
-            // Master switch for the tab, then the show-names switch.
+            // RESET, one per tab, his ask: "a reset button that turns on all options". Clears the
+            // tab's list and its master switch; the others are not touched.
             GUILayout.Space(4f);
+            if (GUILayout.Button("Turn everything on this tab back ON", GUILayout.Height(26f)))
+            {
+                if (_tab == 0)      { _mutedAmbientSet.Clear(); _muteAllAmbient.Value = false; }
+                else if (_tab == 1) { _mutedAnimalSet.Clear();  _muteAllAnimals.Value = false; }
+                else                { _mutedJungleSet.Clear();  _muteAllJungle.Value  = false; _jungleAt = 0f; }
+                SaveLists();
+                Logger.LogInfo("panel: reset tab " + _tab + " - everything on");
+            }
             if (_tab == 0)
             {
                 bool all = GUILayout.Toggle(!_muteAllAmbient.Value, "  whole ambient layer");
