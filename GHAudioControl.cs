@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.1.0";
+        public const string Version = "1.2.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -63,6 +63,8 @@ namespace GHAudioControl
         private ConfigEntry<bool>   _showNames;
         private ConfigEntry<float>  _nameSeconds;
         private ConfigEntry<string> _windowPos;
+        private ConfigEntry<string> _namePos;
+        private Rect _nameRect = new Rect(-1f, -1f, 320f, 34f);
 
         private readonly HashSet<string> _mutedAmbientSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _mutedAnimalSet  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -89,7 +91,7 @@ namespace GHAudioControl
         private int  _tab;                       // 0 Ambient, 1 True animal voice
         private Rect _rect = new Rect(200f, 120f, 420f, 560f);
         private Vector2 _scroll;
-        private GUIStyle _title, _row, _tabOn, _tabOff, _dim;
+        private GUIStyle _title, _row, _tabOn, _tabOff, _dim, _rowBtn, _rowBtnDim, _nameStyle;
         private bool _styled;
         private Texture2D _radioOn, _radioOff, _pixel;
         private readonly Dictionary<string, Texture2D> _icons = new Dictionary<string, Texture2D>();
@@ -127,6 +129,9 @@ namespace GHAudioControl
                     new AcceptableValueRange<float>(1f, 15f)));
             _windowPos = Config.Bind("Panel", "WindowPosition", "",
                 "Where the panel was last dragged. Written automatically.");
+            _namePos = Config.Bind("Panel", "NamePosition", "",
+                "Where the name-of-the-sound line was last dragged. Drag it anywhere. Written " +
+                "automatically.");
 
             ParseLists();
             LoadWindowPos();
@@ -243,8 +248,8 @@ namespace GHAudioControl
                     {
                         AudioSource src = kv.Value[i];
                         if (src == null) continue;
-                        if (mute) { if (!src.mute) { src.mute = true; _weMuted.Add(src); } }
-                        else if (_weMuted.Contains(src)) { src.mute = false; _weMuted.Remove(src); }
+                        if (mute) { if (!src.mute) { src.mute = true; _weMuted.Add(src); Logger.LogInfo("jungle: muted '" + kv.Key + "' (" + src.gameObject.name + ")"); } }
+                        else if (_weMuted.Contains(src)) { src.mute = false; _weMuted.Remove(src); Logger.LogInfo("jungle: un-muted '" + kv.Key + "'"); }
                     }
                 }
             }
@@ -398,19 +403,51 @@ namespace GHAudioControl
             {
                 BuildStyles();
 
-                if (_showNames.Value && Time.realtimeSinceStartup < s_NowPlayingUntil && s_NowPlaying.Length > 0)
+                // The name line is its own small window so it can be dragged anywhere - his ask,
+                // "I wish I could move that name freely". It stays where it was put. While the
+                // panel is open it is always shown, so there is something to grab.
+                bool showName = _showNames.Value
+                    && (_open || (Time.realtimeSinceStartup < s_NowPlayingUntil && s_NowPlaying.Length > 0));
+                if (showName)
                 {
-                    GUIContent c = new GUIContent(s_NowPlaying);
-                    Vector2 sz = _row.CalcSize(c);
-                    Rect r = new Rect((Screen.width - sz.x) * 0.5f - 10f, Screen.height * 0.82f, sz.x + 20f, sz.y + 8f);
-                    GUI.DrawTexture(r, _pixel);
-                    GUI.Label(new Rect(r.x + 10f, r.y + 4f, sz.x, sz.y), c, _row);
+                    if (_nameRect.x < 0f)
+                    {
+                        _nameRect.x = (Screen.width - _nameRect.width) * 0.5f;
+                        _nameRect.y = Screen.height * 0.82f;
+                        LoadNamePos();
+                    }
+                    _nameRect = GUI.Window(0x6A0D11, _nameRect, DrawNameWindow, "", GUIStyle.none);
                 }
 
                 if (!_open) return;
                 _rect = GUI.Window(0x6A0D10, _rect, DrawWindow, "");
             }
             catch (Exception ex) { Logger.LogWarning("panel: " + ex.Message); }
+        }
+
+        private void DrawNameWindow(int id)
+        {
+            GUI.DrawTexture(new Rect(0f, 0f, _nameRect.width, _nameRect.height), _pixel);
+            string text = (s_NowPlaying.Length > 0 && Time.realtimeSinceStartup < s_NowPlayingUntil)
+                          ? s_NowPlaying : (_open ? "(sound names appear here - drag me)" : "");
+            GUI.Label(new Rect(0f, 0f, _nameRect.width, _nameRect.height), text, _nameStyle);
+            GUI.DragWindow(new Rect(0f, 0f, _nameRect.width, _nameRect.height));
+            string v = Mathf.RoundToInt(_nameRect.x) + "," + Mathf.RoundToInt(_nameRect.y);
+            if (v != _namePos.Value) _namePos.Value = v;
+        }
+
+        private void LoadNamePos()
+        {
+            try
+            {
+                string[] p = (_namePos.Value ?? "").Split(',');
+                if (p.Length == 2)
+                {
+                    float x, y;
+                    if (float.TryParse(p[0], out x) && float.TryParse(p[1], out y)) { _nameRect.x = x; _nameRect.y = y; }
+                }
+            }
+            catch (Exception) { }
         }
 
         private void DrawWindow(int id)
@@ -502,23 +539,28 @@ namespace GHAudioControl
             SaveWindowPos();
         }
 
-        /// <summary>One row: icon, name, radio. Returns the new on/off.</summary>
+        /// <summary>
+        /// One row: icon, name, radio. Returns the new on/off.
+        ///
+        /// A REAL BUTTON NOW. The first build read the mouse itself against GetLastRect after the
+        /// row's layout group, and his config shows what that was worth: one jungle row registered
+        /// and every ambient and animal row he clicked did not - "nothing I select seems to be
+        /// turned off". IMGUI's own Button has handled clicks inside scroll views and windows for
+        /// fifteen years; the radio is drawn over it as the state, and the button is the target.
+        /// </summary>
         private bool Row(Texture2D icon, string label, bool on)
         {
-            GUILayout.BeginHorizontal(GUILayout.Height(30f));
-            Rect ir = GUILayoutUtility.GetRect(26f, 26f, GUILayout.Width(26f));
-            if (icon != null) GUI.DrawTexture(ir, icon, ScaleMode.ScaleToFit, true);
-            GUILayout.Space(6f);
-            GUILayout.Label(label, on ? _row : _dim, GUILayout.ExpandWidth(true));
-            Rect rr = GUILayoutUtility.GetRect(22f, 22f, GUILayout.Width(22f));
-            GUI.DrawTexture(rr, on ? _radioOn : _radioOff, ScaleMode.ScaleToFit, true);
-            GUILayout.EndHorizontal();
-
-            // The whole row is the button - the radio is the state, not a small target.
-            Rect whole = GUILayoutUtility.GetLastRect();
-            if (Event.current.type == EventType.MouseUp && whole.Contains(Event.current.mousePosition))
+            GUIContent c = new GUIContent("    " + label, icon);
+            bool clicked = GUILayout.Button(c, on ? _rowBtn : _rowBtnDim, GUILayout.Height(32f));
+            if (Event.current.type == EventType.Repaint)
             {
-                Event.current.Use();
+                Rect r = GUILayoutUtility.GetLastRect();
+                Rect rr = new Rect(r.xMax - 30f, r.y + (r.height - 22f) * 0.5f, 22f, 22f);
+                GUI.DrawTexture(rr, on ? _radioOn : _radioOff, ScaleMode.ScaleToFit, true);
+            }
+            if (clicked)
+            {
+                Logger.LogInfo("panel: " + label + " -> " + (on ? "OFF" : "ON"));
                 return !on;
             }
             return on;
@@ -648,6 +690,22 @@ namespace GHAudioControl
             _dim = new GUIStyle(_row);
             _dim.normal.textColor = new Color(0.55f, 0.57f, 0.62f);
 
+            // A button that looks like a row: no box, icon on the left, text beside it.
+            _rowBtn = new GUIStyle(GUI.skin.button);
+            _rowBtn.fontSize = 15; _rowBtn.alignment = TextAnchor.MiddleLeft;
+            _rowBtn.imagePosition = ImagePosition.ImageLeft;
+            _rowBtn.normal.background = null; _rowBtn.active.background = null;
+            _rowBtn.focused.background = null;
+            _rowBtn.hover.background = HoverTex();
+            _rowBtn.normal.textColor = _row.normal.textColor;
+            _rowBtn.hover.textColor = Color.white; _rowBtn.active.textColor = Color.white;
+            _rowBtn.padding = new RectOffset(6, 34, 3, 3);
+            _rowBtnDim = new GUIStyle(_rowBtn);
+            _rowBtnDim.normal.textColor = _dim.normal.textColor;
+
+            _nameStyle = new GUIStyle(_row);
+            _nameStyle.alignment = TextAnchor.MiddleCenter;
+
             _tabOn = new GUIStyle(GUI.skin.button);
             _tabOn.fontSize = 15; _tabOn.fontStyle = FontStyle.Bold;
             _tabOn.normal.textColor = new Color(0.55f, 0.75f, 1f);
@@ -655,6 +713,14 @@ namespace GHAudioControl
             _tabOff = new GUIStyle(GUI.skin.button);
             _tabOff.fontSize = 15;
             _tabOff.normal.textColor = new Color(0.7f, 0.72f, 0.76f);
+        }
+
+        private static Texture2D HoverTex()
+        {
+            Texture2D t = new Texture2D(1, 1, TextureFormat.ARGB32, false);
+            t.SetPixel(0, 0, new Color(1f, 1f, 1f, 0.08f));
+            t.Apply();
+            return t;
         }
 
         /// <summary>A circle, and a circle with a dot in the middle. Drawn, not a font glyph.</summary>
