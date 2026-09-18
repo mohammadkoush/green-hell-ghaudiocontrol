@@ -20,7 +20,14 @@
 // Nothing in the game names these sounds for the player, so while you decide, a small line on the
 // screen names each one as it plays: "Ambient: howler_monkey_03", "Tapir: idle". Off when you are done.
 //
-// The panel is the game-window style: K opens it, two tabs, an icon and a radio switch per row.
+// JUNGLE - everything that is not an animal: the rainforest bed (one multi-sample the game mixes
+//          from named layers - rain, wind, water, the day and night beds), the rain manager's own
+//          source with its thunder, and the loose emitters placed in the world (rivers, waterfalls,
+//          a PlayRadomSound each - the game's spelling). Muted by AudioSource.mute, which is
+//          reversible and leaves the game's own volume curves untouched. Rows are discovered from
+//          the running game, so the list is whatever this version of the game actually plays.
+//
+// The panel is the game-window style: K opens it, three tabs, an icon and a radio switch per row.
 // Icons are the same set Field Notes draws its map with, so a tapir looks the same in both mods.
 //
 // Language level is C# 5 (stock Framework csc.exe) - no ?., no $"", no ??=.
@@ -41,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -49,6 +56,8 @@ namespace GHAudioControl
         private ConfigEntry<KeyboardShortcut> _key;
         private ConfigEntry<string> _mutedAmbient;
         private ConfigEntry<string> _mutedAnimals;
+        private ConfigEntry<string> _mutedJungle;
+        private ConfigEntry<bool>   _muteAllJungle;
         private ConfigEntry<bool>   _muteAllAmbient;
         private ConfigEntry<bool>   _muteAllAnimals;
         private ConfigEntry<bool>   _showNames;
@@ -57,6 +66,14 @@ namespace GHAudioControl
 
         private readonly HashSet<string> _mutedAmbientSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _mutedAnimalSet  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _mutedJungleSet  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Jungle rows: a name -> the sources that play it. Rebuilt on a slow timer, because emitters
+        // stream in and out with the world.
+        private readonly Dictionary<string, List<AudioSource>> _jungle = new Dictionary<string, List<AudioSource>>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> _jungleNames = new List<string>();
+        private readonly HashSet<AudioSource> _weMuted = new HashSet<AudioSource>();
+        private float _jungleAt;
 
         // ---- what exists -------------------------------------------------------------------------
         private readonly List<string> _ambientNames = new List<string>();   // clip names, discovered
@@ -96,6 +113,12 @@ namespace GHAudioControl
                 "Master switch for the whole ambient animal layer.");
             _muteAllAnimals = Config.Bind("Mute", "AllAnimalVoices", false,
                 "Master switch for every creature's idle calls.");
+            _mutedJungle = Config.Bind("Mute", "Jungle", "",
+                "Jungle layers switched OFF, by name, comma separated: the rainforest bed's layers " +
+                "(rain, wind, water, day, night...), 'Rain and thunder', and world emitters by clip " +
+                "name (rivers, waterfalls). Written by the panel.");
+            _muteAllJungle = Config.Bind("Mute", "AllJungle", false,
+                "Master switch for every jungle layer - the game's Environment slider, split.");
             _showNames = Config.Bind("Panel", "ShowNamesOnScreen", true,
                 "Name each sound on screen as it plays, so you can decide what to switch off. " +
                 "Turn it off once you are done choosing.");
@@ -135,12 +158,104 @@ namespace GHAudioControl
             _mutedAnimalSet.Clear();
             foreach (string s in (_mutedAnimals.Value ?? "").Split(','))
                 if (s.Trim().Length > 0) _mutedAnimalSet.Add(s.Trim());
+            _mutedJungleSet.Clear();
+            foreach (string s in (_mutedJungle.Value ?? "").Split(','))
+                if (s.Trim().Length > 0) _mutedJungleSet.Add(s.Trim());
         }
 
         private void SaveLists()
         {
             _mutedAmbient.Value = string.Join(", ", new List<string>(_mutedAmbientSet).ToArray());
             _mutedAnimals.Value = string.Join(", ", new List<string>(_mutedAnimalSet).ToArray());
+            _mutedJungle.Value  = string.Join(", ", new List<string>(_mutedJungleSet).ToArray());
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // Jungle: discover, then mute by name
+        // -----------------------------------------------------------------------------------------
+
+        private static FieldInfo s_AmbientMS, s_SampleSource, s_RainSource;
+
+        private void JungleTick()
+        {
+            float now = Time.realtimeSinceStartup;
+            if (now - _jungleAt < 2f) return;
+            _jungleAt = now;
+
+            try
+            {
+                _jungle.Clear();
+
+                // 1. The rainforest bed: one multi-sample, its layers named by wav.
+                AmbientAudioSystem sys = AmbientAudioSystem.Instance;
+                if (sys != null)
+                {
+                    if (s_AmbientMS == null) s_AmbientMS = AccessTools.Field(typeof(AmbientAudioSystem), "m_AmbientMS");
+                    MSMultiSample ms = (s_AmbientMS != null) ? s_AmbientMS.GetValue(sys) as MSMultiSample : null;
+                    if (ms != null && ms.m_Samples != null)
+                    {
+                        if (s_SampleSource == null) s_SampleSource = AccessTools.Field(typeof(MSSample), "m_AudioSource");
+                        for (int i = 0; i < ms.m_Samples.Count; i++)
+                        {
+                            MSSample smp = ms.m_Samples[i];
+                            if (smp == null || s_SampleSource == null) continue;
+                            AudioSource src = s_SampleSource.GetValue(smp) as AudioSource;
+                            if (src == null) continue;
+                            string nm = string.IsNullOrEmpty(smp.m_WavName) ? ("bed layer " + i) : smp.m_WavName;
+                            Add("Bed: " + nm, src);
+                        }
+                    }
+                }
+
+                // 2. Rain and thunder: the rain manager's own source.
+                RainManager rm = RainManager.Get();
+                if (rm != null)
+                {
+                    if (s_RainSource == null) s_RainSource = AccessTools.Field(typeof(RainManager), "m_AudioSource");
+                    AudioSource src = (s_RainSource != null) ? s_RainSource.GetValue(rm) as AudioSource : null;
+                    if (src != null) Add("Rain and thunder", src);
+                }
+
+                // 3. Emitters placed in the world - rivers, waterfalls, whatever the level author put
+                //    down. Named by their first clip, which is what they actually sound like.
+                PlayRadomSound[] all = UnityEngine.Object.FindObjectsOfType<PlayRadomSound>();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    PlayRadomSound e = all[i];
+                    if (e == null || e.m_AudioSource == null) continue;
+                    string nm = null;
+                    if (e.m_Clips != null && e.m_Clips.Count > 0 && e.m_Clips[0] != null) nm = e.m_Clips[0].name;
+                    if (nm == null && e.m_AudioSource.clip != null) nm = e.m_AudioSource.clip.name;
+                    if (nm == null) nm = e.gameObject.name;
+                    Add("World: " + nm, e.m_AudioSource);
+                }
+
+                _jungleNames.Clear();
+                _jungleNames.AddRange(_jungle.Keys);
+                _jungleNames.Sort(StringComparer.OrdinalIgnoreCase);
+
+                // Apply. Only sources this mod muted are ever un-muted, so a source the game itself
+                // keeps silent stays the game's business.
+                foreach (KeyValuePair<string, List<AudioSource>> kv in _jungle)
+                {
+                    bool mute = _muteAllJungle.Value || _mutedJungleSet.Contains(kv.Key);
+                    for (int i = 0; i < kv.Value.Count; i++)
+                    {
+                        AudioSource src = kv.Value[i];
+                        if (src == null) continue;
+                        if (mute) { if (!src.mute) { src.mute = true; _weMuted.Add(src); } }
+                        else if (_weMuted.Contains(src)) { src.mute = false; _weMuted.Remove(src); }
+                    }
+                }
+            }
+            catch (Exception ex) { Logger.LogWarning("jungle: " + ex.Message); }
+        }
+
+        private void Add(string name, AudioSource src)
+        {
+            List<AudioSource> l;
+            if (!_jungle.TryGetValue(name, out l)) { l = new List<AudioSource>(); _jungle[name] = l; }
+            l.Add(src);
         }
 
         /// <summary>
@@ -270,6 +385,7 @@ namespace GHAudioControl
             try
             {
                 DiscoverAmbient();
+                JungleTick();
                 if (_key.Value.IsDown()) _open = !_open;
                 if (_open && Input.GetKeyDown(KeyCode.Escape)) _open = false;
             }
@@ -308,6 +424,7 @@ namespace GHAudioControl
             GUILayout.BeginHorizontal();
             if (GUILayout.Toggle(_tab == 0, "Ambient", _tab == 0 ? _tabOn : _tabOff)) _tab = 0;
             if (GUILayout.Toggle(_tab == 1, "True animal voice", _tab == 1 ? _tabOn : _tabOff)) _tab = 1;
+            if (GUILayout.Toggle(_tab == 2, "Jungle", _tab == 2 ? _tabOn : _tabOff)) _tab = 2;
             GUILayout.EndHorizontal();
 
             // Master switch for the tab, then the show-names switch.
@@ -317,10 +434,15 @@ namespace GHAudioControl
                 bool all = GUILayout.Toggle(!_muteAllAmbient.Value, "  whole ambient layer");
                 if (all == _muteAllAmbient.Value) _muteAllAmbient.Value = !all;
             }
-            else
+            else if (_tab == 1)
             {
                 bool all = GUILayout.Toggle(!_muteAllAnimals.Value, "  every creature's idle calls");
                 if (all == _muteAllAnimals.Value) _muteAllAnimals.Value = !all;
+            }
+            else
+            {
+                bool all = GUILayout.Toggle(!_muteAllJungle.Value, "  every jungle layer");
+                if (all == _muteAllJungle.Value) _muteAllJungle.Value = !all;
             }
             bool names = GUILayout.Toggle(_showNames.Value, "  name each sound on screen as it plays");
             if (names != _showNames.Value) _showNames.Value = names;
@@ -339,6 +461,22 @@ namespace GHAudioControl
                     {
                         if (on) _mutedAmbientSet.Add(n); else _mutedAmbientSet.Remove(n);
                         SaveLists();
+                    }
+                }
+            }
+            else if (_tab == 2)
+            {
+                if (_jungleNames.Count == 0)
+                    GUILayout.Label("No jungle layers found yet - they appear once a level is loaded.", _dim);
+                for (int i = 0; i < _jungleNames.Count; i++)
+                {
+                    string n = _jungleNames[i];
+                    bool on = !_mutedJungleSet.Contains(n);
+                    if (Row(IconForJungle(n), n, on) != on)
+                    {
+                        if (on) _mutedJungleSet.Add(n); else _mutedJungleSet.Remove(n);
+                        SaveLists();
+                        _jungleAt = 0f;                       // apply now, not in two seconds
                     }
                 }
             }
@@ -451,6 +589,21 @@ namespace GHAudioControl
             else if (n.Contains("snake")) f = "snake";
             else if (n.Contains("tapir")) f = "tapir";
             else if (n.Contains("capybara")) f = "capybara";
+            return Icon(f);
+        }
+
+        private Texture2D IconForJungle(string name)
+        {
+            string n = name.ToLowerInvariant();
+            string f = "animal";
+            if (n.Contains("rain") || n.Contains("thunder") || n.Contains("storm")) f = "rain";
+            else if (n.Contains("water") || n.Contains("river") || n.Contains("waterfall") || n.Contains("stream")) f = "water";
+            else if (n.Contains("wind")) f = "wind";
+            else if (n.Contains("night")) f = "night";
+            else if (n.Contains("day") || n.Contains("forest") || n.Contains("jungle") || n.Contains("bed")) f = "leaf";
+            else if (n.Contains("insect") || n.Contains("cicada") || n.Contains("cricket")) f = "bug";
+            else if (n.Contains("frog")) f = "frog";
+            else if (n.Contains("bird")) f = "parrot";
             return Icon(f);
         }
 

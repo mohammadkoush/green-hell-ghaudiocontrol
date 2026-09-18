@@ -5,12 +5,15 @@
 The jungle never stops: howler monkeys, macaws, screeches, frogs, every creature near you calling on
 its own timer, and no way in the game to turn any single one down. This mod gives each one a switch.
 
-Press **K** in game. Two tabs:
+Press **K** in game. Three tabs:
 
 - **Ambient** — the background animal layer. No animal is there; the game plays a random clip from a
   list, somewhere in the trees, on a timer. One row per clip, by its name.
 - **True animal voice** — the idle calls of real creatures near you. One row per species, with its
   icon. Attack, panic and death sounds always play: those are warnings.
+- **Jungle** — everything that is not an animal: the rainforest bed's own layers (rain, wind, water,
+  the day and night beds — named as the game names them), rain and thunder, and the emitters placed
+  in the world such as rivers and waterfalls. The game's Environment slider, split into rows.
 
 Each row is an icon, a name and a radio switch. Click the row to flip it. A master switch at the top
 of each tab silences the whole layer.
