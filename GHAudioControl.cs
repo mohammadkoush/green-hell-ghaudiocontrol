@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.2.0";
+        public const string Version = "1.3.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -129,6 +129,9 @@ namespace GHAudioControl
                     new AcceptableValueRange<float>(1f, 15f)));
             _windowPos = Config.Bind("Panel", "WindowPosition", "",
                 "Where the panel was last dragged. Written automatically.");
+            _logPlaying = Config.Bind("Diagnostics", "LogEveryPlayingClip", true,
+                "Write one log line the first time each clip is heard playing - the object it is " +
+                "on, its parent, its volume. This is how a sound that will not mute names itself.");
             _namePos = Config.Bind("Panel", "NamePosition", "",
                 "Where the name-of-the-sound line was last dragged. Drag it anywhere. Written " +
                 "automatically.");
@@ -165,7 +168,13 @@ namespace GHAudioControl
                 if (s.Trim().Length > 0) _mutedAnimalSet.Add(s.Trim());
             _mutedJungleSet.Clear();
             foreach (string s in (_mutedJungle.Value ?? "").Split(','))
-                if (s.Trim().Length > 0) _mutedJungleSet.Add(s.Trim());
+            {
+                string k = s.Trim();
+                // 1.1/1.2 keyed these as "Bed: name" and "World: name"; rows are clip names now.
+                if (k.StartsWith("Bed: ", StringComparison.OrdinalIgnoreCase)) k = k.Substring(5);
+                else if (k.StartsWith("World: ", StringComparison.OrdinalIgnoreCase)) k = k.Substring(7);
+                if (k.Length > 0) _mutedJungleSet.Add(k);
+            }
         }
 
         private void SaveLists()
@@ -181,6 +190,17 @@ namespace GHAudioControl
 
         private static FieldInfo s_AmbientMS, s_SampleSource, s_RainSource;
 
+        // EVIDENCE FROM HIS SECOND SESSION: every row flipped, the config filled up, the log wrote
+        // "jungle: muted 'Bed: amb_wind_light_01' (MS_amb_wind_light_01)" for eleven layers and
+        // "Rain and thunder" - and nothing went quiet. So the sources this was muting are not the
+        // ones he hears. The named multi-sample objects may be templates the game copies from, or
+        // the bed may play through sources this never found. Either way: stop assuming which
+        // object plays and go by what IS playing. Every AudioSource in the scene that is playing a
+        // clip right now is a row, by clip name, and muting a row mutes every source playing that
+        // clip, every tick. What he hears is by definition on that list.
+        private readonly HashSet<string> _seenPlaying = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private ConfigEntry<bool> _logPlaying;
+
         private void JungleTick()
         {
             float now = Time.realtimeSinceStartup;
@@ -190,6 +210,26 @@ namespace GHAudioControl
             try
             {
                 _jungle.Clear();
+
+                // 0. Everything that is playing right now, by clip. AI voices and the ambient
+                //    animal source have their own tabs and are left out of this one.
+                AudioSource[] live = UnityEngine.Object.FindObjectsOfType<AudioSource>();
+                AudioSource animalSrc = AnimalSource();
+                for (int i = 0; i < live.Length; i++)
+                {
+                    AudioSource a = live[i];
+                    if (a == null || a.clip == null) continue;
+                    if (!a.isPlaying && !_weMuted.Contains(a)) continue;      // a muted one stops "playing"
+                    if (a == animalSrc) continue;
+                    if (a.GetComponentInParent<AIs.AI>() != null) continue;
+                    if (a.GetComponentInParent<Player>() != null) continue;    // his own footsteps and breath
+                    string nm = a.clip.name;
+                    Add(nm, a);
+                    if (_seenPlaying.Add(nm) && _logPlaying != null && _logPlaying.Value)
+                        Logger.LogInfo("playing: '" + nm + "' on " + a.gameObject.name
+                            + (a.transform.parent != null ? " under " + a.transform.parent.name : "")
+                            + " vol=" + a.volume.ToString("F2") + " loop=" + a.loop);
+                }
 
                 // 1. The rainforest bed: one multi-sample, its layers named by wav.
                 AmbientAudioSystem sys = AmbientAudioSystem.Instance;
@@ -206,8 +246,11 @@ namespace GHAudioControl
                             if (smp == null || s_SampleSource == null) continue;
                             AudioSource src = s_SampleSource.GetValue(smp) as AudioSource;
                             if (src == null) continue;
-                            string nm = string.IsNullOrEmpty(smp.m_WavName) ? ("bed layer " + i) : smp.m_WavName;
-                            Add("Bed: " + nm, src);
+                            // Same key as the live census uses - the clip name - so a bed layer
+                            // that is playing and its template are one row, not two.
+                            string nm = (src.clip != null) ? src.clip.name
+                                      : (string.IsNullOrEmpty(smp.m_WavName) ? ("bed layer " + i) : smp.m_WavName);
+                            Add(nm, src);
                         }
                     }
                 }
@@ -218,7 +261,7 @@ namespace GHAudioControl
                 {
                     if (s_RainSource == null) s_RainSource = AccessTools.Field(typeof(RainManager), "m_AudioSource");
                     AudioSource src = (s_RainSource != null) ? s_RainSource.GetValue(rm) as AudioSource : null;
-                    if (src != null) Add("Rain and thunder", src);
+                    if (src != null) Add(src.clip != null ? src.clip.name : "Rain and thunder", src);
                 }
 
                 // 3. Emitters placed in the world - rivers, waterfalls, whatever the level author put
@@ -232,7 +275,7 @@ namespace GHAudioControl
                     if (e.m_Clips != null && e.m_Clips.Count > 0 && e.m_Clips[0] != null) nm = e.m_Clips[0].name;
                     if (nm == null && e.m_AudioSource.clip != null) nm = e.m_AudioSource.clip.name;
                     if (nm == null) nm = e.gameObject.name;
-                    Add("World: " + nm, e.m_AudioSource);
+                    Add(nm, e.m_AudioSource);
                 }
 
                 _jungleNames.Clear();
@@ -254,6 +297,19 @@ namespace GHAudioControl
                 }
             }
             catch (Exception ex) { Logger.LogWarning("jungle: " + ex.Message); }
+        }
+
+        private static FieldInfo s_AnimalSrcFI;
+        private static AudioSource AnimalSource()
+        {
+            try
+            {
+                AmbientAudioSystem sys = AmbientAudioSystem.Instance;
+                if (sys == null) return null;
+                if (s_AnimalSrcFI == null) s_AnimalSrcFI = AccessTools.Field(typeof(AmbientAudioSystem), "m_AnimalSoundsAudioSource");
+                return (s_AnimalSrcFI != null) ? s_AnimalSrcFI.GetValue(sys) as AudioSource : null;
+            }
+            catch (Exception) { return null; }
         }
 
         private void Add(string name, AudioSource src)
@@ -385,12 +441,33 @@ namespace GHAudioControl
         // Update / window
         // -----------------------------------------------------------------------------------------
 
+        private float _animalStopAt;
+        private void AnimalSourceTick()
+        {
+            // The postfix should make a muted clip never start. If one is playing anyway - a path
+            // this mod did not see - it is stopped here, and the log says so once per clip.
+            float now = Time.realtimeSinceStartup;
+            if (now - _animalStopAt < 0.5f) return;
+            _animalStopAt = now;
+            try
+            {
+                AudioSource a = AnimalSource();
+                if (a == null || !a.isPlaying || a.clip == null) return;
+                if (!AmbientMuted(a.clip.name)) return;
+                a.Stop();
+                if (_seenPlaying.Add("stopped:" + a.clip.name))
+                    Logger.LogInfo("ambient: '" + a.clip.name + "' was playing while muted - stopped it");
+            }
+            catch (Exception) { }
+        }
+
         private void Update()
         {
             try
             {
                 DiscoverAmbient();
                 JungleTick();
+                AnimalSourceTick();
                 if (_key.Value.IsDown()) _open = !_open;
                 if (_open && Input.GetKeyDown(KeyCode.Escape)) _open = false;
             }
@@ -461,7 +538,7 @@ namespace GHAudioControl
             GUILayout.BeginHorizontal();
             if (GUILayout.Toggle(_tab == 0, "Ambient", _tab == 0 ? _tabOn : _tabOff)) _tab = 0;
             if (GUILayout.Toggle(_tab == 1, "True animal voice", _tab == 1 ? _tabOn : _tabOff)) _tab = 1;
-            if (GUILayout.Toggle(_tab == 2, "Jungle", _tab == 2 ? _tabOn : _tabOff)) _tab = 2;
+            if (GUILayout.Toggle(_tab == 2, "Jungle (everything playing)", _tab == 2 ? _tabOn : _tabOff)) _tab = 2;
             GUILayout.EndHorizontal();
 
             // Master switch for the tab, then the show-names switch.
