@@ -48,7 +48,7 @@ namespace GHAudioControl
     {
         public const string Guid    = "com.mohammadkoush.ghaudiocontrol";
         public const string Name    = "GHAudioControl";
-        public const string Version = "1.6.0";
+        public const string Version = "1.7.0";
 
         private static GHAudioControlPlugin s_Self;
 
@@ -124,6 +124,15 @@ namespace GHAudioControl
                 "A creature whose voice is set up as 2D plays at full volume wherever it is - the " +
                 "centipede that seems to follow you. On: such a voice is made 3D so it fades with " +
                 "distance. The log names each species and its settings the first time it calls.");
+            _critterRange = Config.Bind("Voices", "CritterRangeMetres", 8f,
+                new ConfigDescription("How far a critter - centipede, scorpion, spider, beetle, frog, " +
+                    "mouse, crab - can be heard. His words: \"this is a critter, not a bat.\" A " +
+                    "slider in the K panel, True animal voice tab.",
+                    new AcceptableValueRange<float>(2f, 60f)));
+            _critters = Config.Bind("Voices", "CritterSpecies",
+                "Centipede, Scorpion, GoliathBirdEater, BrasilianWanderingSpider, Caterpillar, Beetle, " +
+                "Mouse, PoisonDartFrog, CaneToad, Crab, Prawn",
+                "Which species count as critters for the short range. AI names, comma separated.");
             _voiceRange = Config.Bind("Voices", "VoiceRangeMetres", 20f,
                 new ConfigDescription("How far a repaired voice carries before it is silent.",
                     new AcceptableValueRange<float>(5f, 200f)));
@@ -286,6 +295,8 @@ namespace GHAudioControl
                     if (nm == null) nm = e.gameObject.name;
                     Add(nm, e.m_AudioSource);
                 }
+
+                ReapplyRanges();
 
                 _jungleNames.Clear();
                 _jungleNames.AddRange(_jungle.Keys);
@@ -450,6 +461,34 @@ namespace GHAudioControl
         // that comes back names the numbers.
         private ConfigEntry<bool>  _fix2D;
         private ConfigEntry<float> _voiceRange;
+        private ConfigEntry<float> _critterRange;
+        private ConfigEntry<string> _critters;
+        private readonly Dictionary<AudioSource, string> _repaired = new Dictionary<AudioSource, string>();
+
+        private bool IsCritter(string species)
+        {
+            foreach (string c in (_critters.Value ?? "").Split(','))
+                if (string.Equals(c.Trim(), species, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private float RangeFor(string species)
+        {
+            return IsCritter(species) ? _critterRange.Value : _voiceRange.Value;
+        }
+
+        /// <summary>Sliders move live: every source this mod has repaired is re-ranged each sweep.</summary>
+        private void ReapplyRanges()
+        {
+            List<AudioSource> gone = null;
+            foreach (KeyValuePair<AudioSource, string> kv in _repaired)
+            {
+                if (kv.Key == null) { if (gone == null) gone = new List<AudioSource>(); gone.Add(kv.Key); continue; }
+                float want = RangeFor(kv.Value);
+                if (Mathf.Abs(kv.Key.maxDistance - want) > 0.01f) kv.Key.maxDistance = want;
+            }
+            if (gone != null) foreach (AudioSource a in gone) _repaired.Remove(a);
+        }
         private static FieldInfo s_ModuleSource;
         private readonly HashSet<string> _spatialSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -482,8 +521,9 @@ namespace GHAudioControl
                 // Two ways to be heard from far away: 2D (no distance at all), or 3D with a range
                 // longer than the voices the game itself sets (12 m). Both are corrected; the log
                 // names which it was.
+                float range = RangeFor(species);
                 bool flat = src.spatialBlend < 0.99f;
-                bool far  = !flat && src.maxDistance > _voiceRange.Value;
+                bool far  = !flat && src.maxDistance > range + 0.01f;
                 if (_spatialSeen.Add(key))
                     Logger.LogInfo("creature source: " + key + " spatialBlend=" + src.spatialBlend.ToString("F2")
                         + " min=" + src.minDistance.ToString("F1") + " max=" + src.maxDistance.ToString("F1")
@@ -494,9 +534,11 @@ namespace GHAudioControl
                     src.spatialBlend = 1f;
                     src.rolloffMode = AudioRolloffMode.Linear;      // reaches true silence at max, unlike Logarithmic
                     src.minDistance = 1f;
-                    src.maxDistance = _voiceRange.Value;
+                    src.maxDistance = range;
+                    _repaired[src] = species;
                     if (_spatialSeen.Add("fixed:" + key))
-                        Logger.LogInfo("creature source: " + key + (flat ? " made 3D" : " range clamped") + ", " + _voiceRange.Value + "m linear");
+                        Logger.LogInfo("creature source: " + key + (flat ? " made 3D" : " range clamped") + ", "
+                                       + range + "m linear" + (IsCritter(species) ? " (critter)" : ""));
                 }
             }
             catch (Exception) { }
@@ -520,12 +562,14 @@ namespace GHAudioControl
 
                 if (flat && s_Self._fix2D.Value)
                 {
+                    float range = s_Self.RangeFor(id);
                     src.spatialBlend = 1f;
-                    src.rolloffMode = AudioRolloffMode.Logarithmic;
+                    src.rolloffMode = AudioRolloffMode.Linear;
                     src.minDistance = 1f;
-                    src.maxDistance = s_Self._voiceRange.Value;
+                    src.maxDistance = range;
+                    s_Self._repaired[src] = id;
                     if (s_Self._spatialSeen.Add("fixed:" + id))
-                        s_Self.Logger.LogInfo("voice: " + id + " made 3D, range " + s_Self._voiceRange.Value + "m");
+                        s_Self.Logger.LogInfo("voice: " + id + " made 3D, range " + range + "m");
                 }
             }
             catch (Exception) { }
@@ -779,6 +823,16 @@ namespace GHAudioControl
             }
             bool names = _showNames.Value;
             if (Row(null, "Name each sound on screen as it plays", names) != names) _showNames.Value = !names;
+
+            // HIS ASK: "sliders inside the K menu for the distance that I can hear the critters and
+            // small creatures." Two ranges, live - a moved slider re-ranges every repaired source on
+            // the next sweep.
+            if (_tab == 1)
+            {
+                GUILayout.Space(4f);
+                _critterRange.Value = Slider("Critters and small creatures", _critterRange.Value, 2f, 60f);
+                _voiceRange.Value   = Slider("Other creatures", _voiceRange.Value, 5f, 200f);
+            }
             GUILayout.Space(6f);
 
             _scroll = GUILayout.BeginScrollView(_scroll, false, true);
@@ -865,6 +919,19 @@ namespace GHAudioControl
             _jungleAt = 0f;
             _animalStopAt = 0f;
             _clickAt = Time.realtimeSinceStartup;
+        }
+
+        /// <summary>A labelled slider in metres, laid out like a row: name left, value right, bar under.</summary>
+        private float Slider(string label, float value, float lo, float hi)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("        " + label, _row, GUILayout.ExpandWidth(true));
+            GUILayout.Label(Mathf.RoundToInt(value) + " m", _row, GUILayout.Width(60f));
+            GUILayout.EndHorizontal();
+            float v = GUILayout.HorizontalSlider(value, lo, hi);
+            GUILayout.Space(4f);
+            if (Mathf.Abs(v - value) > 0.01f) _jungleAt = 0f;      // apply on the next Update
+            return v;
         }
 
         /// <summary>A row that does something rather than holding a state: an x in the circle's slot.</summary>
